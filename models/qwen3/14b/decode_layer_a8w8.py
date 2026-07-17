@@ -71,9 +71,8 @@ OUT_N_SUB_K = OUT_TK // OUT_INNER_TK
 
 K_CHUNK = 512
 MLP_TN = 256
-K_SPLITS_MLP = 5
+K_SPLITS_MLP = 1
 MLP_K_SLICE = HIDDEN // K_SPLITS_MLP
-MLP_GATE_UP_DEP_COUNT = K_SPLITS_MLP
 MLP_DUAL_L0_K = 64
 MLP_ON = INTERMEDIATE // MLP_TN
 
@@ -81,9 +80,10 @@ MLP_OUT_CHUNK = 256
 SILU_INNER_CHUNKS = MLP_TN // MLP_OUT_CHUNK
 
 DOWN_TN = 256
-DOWN_K_SLICE = 512
 DOWN_TK = 512
 DOWN_DUAL_L0_K = 64
+DOWN_K_SPLITS = 2
+DOWN_K_SLICE = INTERMEDIATE // DOWN_K_SPLITS
 DOWN_ON = HIDDEN // DOWN_TN
 DOWN_DUAL_PAIR = 2
 DOWN_DUAL_ON = DOWN_ON // DOWN_DUAL_PAIR
@@ -91,7 +91,7 @@ DOWN_DUAL_ON = DOWN_ON // DOWN_DUAL_PAIR
 assert Q_HEAD_PAD % 16 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH
 assert QKV_N_TILE % TN == 0 and HIDDEN % QKV_N_TILE == 0 and KV_HIDDEN % QKV_N_TILE == 0
 assert BLOCK_SIZE % ATTN_TILE == 0 and NUM_KV_HEADS % GP_SIZE == 0
-assert DOWN_TN == 256 and DOWN_TK == DOWN_K_SLICE == 512
+assert DOWN_TN == 256 and DOWN_TK == 512 and DOWN_K_SLICE % DOWN_DUAL_L0_K == 0
 assert N_SPLITS_OUT * OUT_TN == HIDDEN and K_SPLITS_OUT * OUT_TK == HIDDEN
 
 @pl.jit.inline
@@ -174,25 +174,31 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             act_quant_amax_abs_t = pl.maximum(act_quant_amax_f_t, pl.neg(act_quant_amax_f_t))
             act_quant_amax_row_t = pl.reshape(pl.row_max(act_quant_amax_abs_t), [1, BATCH])
             act_quant_amax_t = pl.maximum(act_quant_amax_t, act_quant_amax_row_t)
-        for act_quant_row_t in pl.range(BATCH):
+        act_quant_scale_q_row_t = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+        for act_quant_row_t in pl.unroll(BATCH):
             act_quant_row_amax_t = pl.tensor.read(act_quant_amax_t, [0, act_quant_row_t])
             act_quant_scale_q_t = INT8_SCALE_MAX / act_quant_row_amax_t
             pl.tensor.write(act_scales, [act_quant_row_t, 0], act_quant_row_amax_t / INT8_SCALE_MAX)
-            for act_quant_write_kb_t in pl.range(HIDDEN // RMSNORM_K_CHUNK):
-                act_quant_write_k0_t = act_quant_write_kb_t * RMSNORM_K_CHUNK
-                act_quant_write_bf16_t = pl.slice(
-                    normed_states, [1, RMSNORM_K_CHUNK], [act_quant_row_t, act_quant_write_k0_t]
-                )
-                act_quant_write_f_t = pl.cast(act_quant_write_bf16_t, target_type=pl.FP32)
-                act_quant_scaled_t = pl.mul(act_quant_write_f_t, act_quant_scale_q_t)
-                act_quant_i32_t = pl.cast(act_quant_scaled_t, target_type=pl.INT32, mode="rint")
-                act_quant_i32_t = pl.minimum(
-                    pl.maximum(act_quant_i32_t, pl.full([1, RMSNORM_K_CHUNK], dtype=pl.INT32, value=-127)),
-                    pl.full([1, RMSNORM_K_CHUNK], dtype=pl.INT32, value=127),
-                )
-                act_quant_half_t = pl.cast(act_quant_i32_t, target_type=pl.FP16, mode="round")
-                act_quant_i8_t = pl.cast(act_quant_half_t, target_type=pl.INT8, mode="trunc")
-                normed_i8 = pl.assemble(normed_i8, act_quant_i8_t, [act_quant_row_t, act_quant_write_k0_t])
+            pl.tensor.write(act_quant_scale_q_row_t, [0, act_quant_row_t], act_quant_scale_q_t)
+        act_quant_scale_q_col_t = pl.reshape(act_quant_scale_q_row_t, [BATCH, 1])
+        for act_quant_write_kb_t in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+            act_quant_write_k0_t = act_quant_write_kb_t * RMSNORM_K_CHUNK
+            act_quant_write_bf16_t = normed_states[
+                :, act_quant_write_k0_t : act_quant_write_k0_t + RMSNORM_K_CHUNK
+            ]
+            act_quant_write_f_t = pl.cast(act_quant_write_bf16_t, target_type=pl.FP32)
+            act_quant_scaled_t = pl.row_expand_mul(act_quant_write_f_t, act_quant_scale_q_col_t)
+            act_quant_i32_t = pl.cast(act_quant_scaled_t, target_type=pl.INT32, mode="rint")
+            act_quant_i32_t = pl.minimum(
+                pl.maximum(
+                    act_quant_i32_t,
+                    pl.full([BATCH, RMSNORM_K_CHUNK], dtype=pl.INT32, value=-127),
+                ),
+                pl.full([BATCH, RMSNORM_K_CHUNK], dtype=pl.INT32, value=127),
+            )
+            act_quant_half_t = pl.cast(act_quant_i32_t, target_type=pl.FP16, mode="round")
+            act_quant_i8_t = pl.cast(act_quant_half_t, target_type=pl.INT8, mode="trunc")
+            normed_i8 = pl.assemble(normed_i8, act_quant_i8_t, [0, act_quant_write_k0_t])
     for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
         q_on = q_grid // N_SUB
         n_sub = q_grid - q_on * N_SUB
@@ -444,10 +450,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
             pl.tensor.write(kv_ready, [b], pl.cast(ctx_len * 0 + 1, target_type=pl.INT32))
 
-    down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+    down_acc_parts = pl.create_tensor([DOWN_K_SPLITS * BATCH, HIDDEN], dtype=pl.FP32, manual_dep=True)
     gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
     up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
-
     for fa_core in pl.spmd(
         NUM_CORES,
         name_hint="fa_fused",
@@ -659,57 +664,44 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         inv_rms_tile = pl.assemble(inv_rms_tile, post_inv_rms_col, [0, 0])
 
     silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
-    gate_up_seed_tids = pl.array.create(MLP_ON, pl.TASK_ID)
-    for n_out in pl.parallel(MLP_ON):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_up_seed") as gate_up_seed_tid:
-            gate_n0 = n_out * MLP_TN
-            zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
-            gate_acc_all = pl.assemble(gate_acc_all, zero, [0, gate_n0])
-            up_acc_all = pl.assemble(up_acc_all, zero, [0, gate_n0])
-        gate_up_seed_tids[n_out] = gate_up_seed_tid
-
     for n_out in pl.parallel(MLP_ON):
         gate_n0 = n_out * MLP_TN
-        gate_up_tile_tids = pl.array.create(MLP_GATE_UP_DEP_COUNT, pl.TASK_ID)
-        for k_split in pl.range(K_SPLITS_MLP):
-            gate_k0 = k_split * MLP_K_SLICE
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="gate_up_dual_proj",
-                deps=[gate_up_seed_tids[n_out]],
-                no_dep_args=[gate_acc_all, up_acc_all],
-            ) as gate_up_tid:
-                pyop_a_mat_0 = pl.tile.load(mlp_norm_in, [0, gate_k0], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
-                pyop_a_left_0 = pl.move(pyop_a_mat_0, target_memory=pl.MemorySpace.Left)
-                pyop_gate_w_mat_0 = pl.tile.load(w_gate, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                pyop_gate_w_right_0 = pl.move(pyop_gate_w_mat_0, target_memory=pl.MemorySpace.Right)
-                pyop_up_w_mat_0 = pl.tile.load(w_up, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                pyop_up_w_right_0 = pl.move(pyop_up_w_mat_0, target_memory=pl.MemorySpace.Right)
-                pyop_gate_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_gate_w_right_0)
-                pyop_up_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_up_w_right_0)
-                for kk, (pyop_gate_acc_iter, pyop_up_acc_iter) in pl.pipeline(
-                    MLP_DUAL_L0_K,
-                    MLP_K_SLICE,
-                    MLP_DUAL_L0_K,
-                    stage=2,
-                    init_values=(pyop_gate_c_acc, pyop_up_c_acc),
-                ):
-                    pyop_a_mat_k = pl.tile.load(mlp_norm_in, [0, gate_k0 + kk], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
-                    pyop_gate_w_mat_k = pl.tile.load(w_gate, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                    pyop_up_w_mat_k = pl.tile.load(w_up, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                    pyop_a_left_k = pl.move(pyop_a_mat_k, target_memory=pl.MemorySpace.Left)
-                    pyop_gate_w_right_k = pl.move(pyop_gate_w_mat_k, target_memory=pl.MemorySpace.Right)
-                    pyop_gate_next = pl.tile.matmul_acc(pyop_gate_acc_iter, pyop_a_left_k, pyop_gate_w_right_k)
-                    pyop_up_w_right_k = pl.move(pyop_up_w_mat_k, target_memory=pl.MemorySpace.Right)
-                    pyop_up_next = pl.tile.matmul_acc(pyop_up_acc_iter, pyop_a_left_k, pyop_up_w_right_k)
-                    pyop_gate_c_acc, pyop_up_c_acc = pl.yield_(pyop_gate_next, pyop_up_next)
-                gate_acc_all = pl.tile.store(pyop_gate_c_acc, [0, gate_n0], gate_acc_all, atomic=pl.AtomicType.Add)
-                up_acc_all = pl.tile.store(pyop_up_c_acc, [0, gate_n0], up_acc_all, atomic=pl.AtomicType.Add)
-            gate_up_tile_tids[k_split] = gate_up_tid
+        gate_k0 = 0
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="gate_up_dual_proj",
+            no_dep_args=[gate_acc_all, up_acc_all],
+        ) as gate_up_tid:
+            pyop_a_mat_0 = pl.tile.load(mlp_norm_in, [0, gate_k0], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
+            pyop_a_left_0 = pl.move(pyop_a_mat_0, target_memory=pl.MemorySpace.Left)
+            pyop_gate_w_mat_0 = pl.tile.load(w_gate, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
+            pyop_gate_w_right_0 = pl.move(pyop_gate_w_mat_0, target_memory=pl.MemorySpace.Right)
+            pyop_up_w_mat_0 = pl.tile.load(w_up, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
+            pyop_up_w_right_0 = pl.move(pyop_up_w_mat_0, target_memory=pl.MemorySpace.Right)
+            pyop_gate_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_gate_w_right_0)
+            pyop_up_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_up_w_right_0)
+            for kk, (pyop_gate_acc_iter, pyop_up_acc_iter) in pl.pipeline(
+                MLP_DUAL_L0_K,
+                MLP_K_SLICE,
+                MLP_DUAL_L0_K,
+                stage=2,
+                init_values=(pyop_gate_c_acc, pyop_up_c_acc),
+            ):
+                pyop_a_mat_k = pl.tile.load(mlp_norm_in, [0, gate_k0 + kk], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
+                pyop_gate_w_mat_k = pl.tile.load(w_gate, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
+                pyop_up_w_mat_k = pl.tile.load(w_up, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
+                pyop_a_left_k = pl.move(pyop_a_mat_k, target_memory=pl.MemorySpace.Left)
+                pyop_gate_w_right_k = pl.move(pyop_gate_w_mat_k, target_memory=pl.MemorySpace.Right)
+                pyop_gate_next = pl.tile.matmul_acc(pyop_gate_acc_iter, pyop_a_left_k, pyop_gate_w_right_k)
+                pyop_up_w_right_k = pl.move(pyop_up_w_mat_k, target_memory=pl.MemorySpace.Right)
+                pyop_up_next = pl.tile.matmul_acc(pyop_up_acc_iter, pyop_a_left_k, pyop_up_w_right_k)
+                pyop_gate_c_acc, pyop_up_c_acc = pl.yield_(pyop_gate_next, pyop_up_next)
+            gate_acc_all = pl.tile.store(pyop_gate_c_acc, [0, gate_n0], gate_acc_all)
+            up_acc_all = pl.tile.store(pyop_up_c_acc, [0, gate_n0], up_acc_all)
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="silu",
-            deps=[gate_up_tile_tids],
+            deps=[gate_up_tid],
             no_dep_args=[mlp_down_tile],
         ) as silu_tid:
             silu_inv_rms_chunk = inv_rms_tile[:, 0:1]
@@ -726,94 +718,101 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         silu_tids[n_out] = silu_tid
     silu_barrier = pl.system.task_dummy(deps=[silu_tids])
 
-    down_dual_tids = pl.array.create(DOWN_DUAL_ON, pl.TASK_ID)
+    down_dual_tids = pl.array.create(DOWN_DUAL_ON * DOWN_K_SPLITS, pl.TASK_ID)
     for n_pair in pl.parallel(DOWN_DUAL_ON):
         down_n0 = n_pair * DOWN_DUAL_PAIR * DOWN_TN
         down_n1 = down_n0 + DOWN_TN
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
-            no_dep_args=[down_acc_all],
-            name_hint="down_dual_proj",
-            deps=[silu_barrier],
-        ) as down_dual_tid:
-            down_a_mat_0 = pl.tile.load(
-                mlp_down_tile,
-                [0, 0],
-                [BATCH, DOWN_DUAL_L0_K],
-                [ACTIVE_BATCH, DOWN_DUAL_L0_K],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_a_left_0 = pl.move(down_a_mat_0, target_memory=pl.MemorySpace.Left)
-            down_w0_mat_0 = pl.tile.load(
-                w_down,
-                [layer_inter_base, down_n0],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_w0_right_0 = pl.move(down_w0_mat_0, target_memory=pl.MemorySpace.Right)
-            down_acc0 = pl.tile.matmul(down_a_left_0, down_w0_right_0)
-            down_w1_mat_0 = pl.tile.load(
-                w_down,
-                [layer_inter_base, down_n1],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_w1_right_0 = pl.move(down_w1_mat_0, target_memory=pl.MemorySpace.Right)
-            down_acc1 = pl.tile.matmul(down_a_left_0, down_w1_right_0)
-            for down_k0, (down_acc0_iter, down_acc1_iter) in pl.pipeline(
-                DOWN_DUAL_L0_K,
-                INTERMEDIATE,
-                DOWN_DUAL_L0_K,
-                stage=2,
-                init_values=(down_acc0, down_acc1),
-            ):
-                down_a_mat = pl.tile.load(
+        for down_k_split in pl.range(DOWN_K_SPLITS):
+            down_k_base = down_k_split * DOWN_K_SLICE
+            down_part_row = down_k_split * BATCH
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+                no_dep_args=[down_acc_parts],
+                name_hint="down_dual_proj",
+                deps=[silu_barrier],
+            ) as down_dual_tid:
+                down_a_mat_0 = pl.tile.load(
                     mlp_down_tile,
-                    [0, down_k0],
+                    [0, down_k_base],
                     [BATCH, DOWN_DUAL_L0_K],
                     [ACTIVE_BATCH, DOWN_DUAL_L0_K],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_a_left = pl.move(down_a_mat, target_memory=pl.MemorySpace.Left)
-                down_w0_mat = pl.tile.load(
+                down_a_left_0 = pl.move(down_a_mat_0, target_memory=pl.MemorySpace.Left)
+                down_w0_mat_0 = pl.tile.load(
                     w_down,
-                    [layer_inter_base + down_k0, down_n0],
+                    [layer_inter_base + down_k_base, down_n0],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_w0_right = pl.move(down_w0_mat, target_memory=pl.MemorySpace.Right)
-                down_next0 = pl.tile.matmul_acc(down_acc0_iter, down_a_left, down_w0_right)
-                down_w1_mat = pl.tile.load(
+                down_w0_right_0 = pl.move(down_w0_mat_0, target_memory=pl.MemorySpace.Right)
+                down_acc0 = pl.tile.matmul(down_a_left_0, down_w0_right_0)
+                down_w1_mat_0 = pl.tile.load(
                     w_down,
-                    [layer_inter_base + down_k0, down_n1],
+                    [layer_inter_base + down_k_base, down_n1],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_w1_right = pl.move(down_w1_mat, target_memory=pl.MemorySpace.Right)
-                down_next1 = pl.tile.matmul_acc(down_acc1_iter, down_a_left, down_w1_right)
-                down_acc0, down_acc1 = pl.yield_(down_next0, down_next1)
-            down_acc_all = pl.tile.store(down_acc0, [0, down_n0], down_acc_all)
-            down_acc_all = pl.tile.store(down_acc1, [0, down_n1], down_acc_all)
-        down_dual_tids[n_pair] = down_dual_tid
+                down_w1_right_0 = pl.move(down_w1_mat_0, target_memory=pl.MemorySpace.Right)
+                down_acc1 = pl.tile.matmul(down_a_left_0, down_w1_right_0)
+                for down_k0, (down_acc0_iter, down_acc1_iter) in pl.pipeline(
+                    DOWN_DUAL_L0_K,
+                    DOWN_K_SLICE,
+                    DOWN_DUAL_L0_K,
+                    stage=2,
+                    init_values=(down_acc0, down_acc1),
+                ):
+                    down_a_mat = pl.tile.load(
+                        mlp_down_tile,
+                        [0, down_k_base + down_k0],
+                        [BATCH, DOWN_DUAL_L0_K],
+                        [ACTIVE_BATCH, DOWN_DUAL_L0_K],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_a_left = pl.move(down_a_mat, target_memory=pl.MemorySpace.Left)
+                    down_w0_mat = pl.tile.load(
+                        w_down,
+                        [layer_inter_base + down_k_base + down_k0, down_n0],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_w0_right = pl.move(down_w0_mat, target_memory=pl.MemorySpace.Right)
+                    down_next0 = pl.tile.matmul_acc(down_acc0_iter, down_a_left, down_w0_right)
+                    down_w1_mat = pl.tile.load(
+                        w_down,
+                        [layer_inter_base + down_k_base + down_k0, down_n1],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_w1_right = pl.move(down_w1_mat, target_memory=pl.MemorySpace.Right)
+                    down_next1 = pl.tile.matmul_acc(down_acc1_iter, down_a_left, down_w1_right)
+                    down_acc0, down_acc1 = pl.yield_(down_next0, down_next1)
+                down_acc_parts = pl.tile.store(down_acc0, [down_part_row, down_n0], down_acc_parts)
+                down_acc_parts = pl.tile.store(down_acc1, [down_part_row, down_n1], down_acc_parts)
+            down_dual_tids[n_pair * DOWN_K_SPLITS + down_k_split] = down_dual_tid
 
     with pl.spmd(
         DOWN_ON,
         name_hint="down_cast_residual",
-        deps=[down_dual_tids[i] for i in range(DOWN_DUAL_ON)],
+        deps=[down_dual_tids[i] for i in range(DOWN_DUAL_ON * DOWN_K_SPLITS)],
     ) as _down_cast_tid:
         n_out = pl.tile.get_block_idx()
         down_cast_n0 = n_out * DOWN_TN
         resid_block_bf16 = post_norm_partial[:, down_cast_n0 : down_cast_n0 + DOWN_TN]
         resid_block = pl.cast(resid_block_bf16, target_type=pl.FP32)
-        acc_chunk_bf16 = pl.cast(
-            down_acc_all[:, down_cast_n0 : down_cast_n0 + DOWN_TN],
-            target_type=pl.BF16,
-        )
+        acc_chunk = down_acc_parts[0:BATCH, down_cast_n0 : down_cast_n0 + DOWN_TN]
+        for down_k_split in pl.unroll(1, DOWN_K_SPLITS):
+            down_part_row = down_k_split * BATCH
+            acc_chunk = pl.add(
+                acc_chunk,
+                down_acc_parts[down_part_row : down_part_row + BATCH, down_cast_n0 : down_cast_n0 + DOWN_TN],
+            )
+        acc_chunk_bf16 = pl.cast(acc_chunk, target_type=pl.BF16)
         acc_chunk = pl.cast(acc_chunk_bf16, target_type=pl.FP32)
         out_chunk = pl.add(acc_chunk, resid_block)
         out_bf16 = pl.cast(out_chunk, target_type=pl.BF16)
