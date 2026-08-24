@@ -1066,6 +1066,7 @@ def prefill_fwd(
         [LOCAL_PREFILL_BATCH, N_RANKS], pl.INT32
     ],
     my_rank: pl.Scalar[pl.INT32],
+    active_local_slots: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[LOCAL_PREFILL_BATCH, FWD_TOKENS_DYN, D], pl.BF16]:
     x_hc.bind_dynamic(1, FWD_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_TOKENS_DYN)
@@ -1083,17 +1084,6 @@ def prefill_fwd(
     moe_epochs_per_request: pl.Scalar[pl.INT32] = pl.cast(
         tokens_per_request // T * LAST_MOE_EPOCH, pl.INT32
     )
-    active_local_slots: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
-    for local_slot in pl.range(LOCAL_PREFILL_BATCH):
-        slot_tokens: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
-        for owner_rank in pl.range(N_RANKS):
-            slot_tokens = pl.max(
-                slot_tokens,
-                pl.read(num_tokens_per_owner, [local_slot, owner_rank]),
-            )
-        if slot_tokens > 0:
-            active_local_slots = pl.cast(local_slot + 1, pl.INT32)
-
     for local_slot in pl.range(active_local_slots):
         moe_epoch_offset: pl.Scalar[pl.INT32] = pl.cast(
             local_slot * moe_epochs_per_request, pl.INT32
@@ -1299,6 +1289,7 @@ def l3_prefill_fwd(
     logit_row_indices: pl.Tensor[
         [N_RANKS, LOCAL_PREFILL_BATCH, MAX_LOGIT_ROWS], pl.INT32
     ],
+    active_local_slots: pl.Scalar[pl.INT32],
 ):
 
     x_hc.bind_dynamic(2, FWD_TOKENS_DYN)
@@ -1328,17 +1319,6 @@ def l3_prefill_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-
-    active_local_slots: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
-    for local_slot in pl.range(LOCAL_PREFILL_BATCH):
-        slot_tokens: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
-        for owner_rank in pl.range(N_RANKS):
-            slot_tokens = pl.max(
-                slot_tokens,
-                pl.read(num_tokens_per_owner, [local_slot, owner_rank]),
-            )
-        if slot_tokens > 0:
-            active_local_slots = pl.cast(local_slot + 1, pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1383,6 +1363,7 @@ def l3_prefill_fwd(
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r], routed_w2[r],
             routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
             shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], num_tokens_per_owner, r,
+            active_local_slots,
             device=r,
         )
 
@@ -2099,6 +2080,9 @@ def build_tensor_specs(
         torch.int32,
         init_value=init_logit_row_indices,
     ))
+    specs.append(
+        ScalarSpec("active_local_slots", torch.int32, LOCAL_PREFILL_BATCH)
+    )
     return specs
 
 
