@@ -64,7 +64,7 @@ SAMPLED_IDS_PAD = 8
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 
 # tiling -- both matmul tiles clear the 512 B contiguous-transfer floor
-FUSED_K_TILE = 256
+FUSED_K_TILE = 128
 FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
@@ -118,6 +118,7 @@ def lm_head(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    clear_after_call: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
@@ -311,15 +312,13 @@ def lm_head(
                     tl = src_vocab_base + tail_o0
                     logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
 
-    # Every local wait has observed all current-round peer notifies before the
-    # logits gather can complete. Clear only this rank's counters so a retained
-    # CommDomain can safely reuse the fixed done_epoch on the next forward.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
-        _completion_anchor = pl.read(logits, [0, 0])
-        zero = pl.cast(0, pl.INT32)
-        for src_tp in pl.range(TP_SIZE):
-            pl.write(hidden_done, [src_tp, 0], zero)
-            pl.write(logits_done, [src_tp, 0], zero)
+    if clear_after_call != 0:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
+            _completion_anchor = pl.read(logits, [0, 0])
+            zero = pl.cast(0, pl.INT32)
+            for src_tp in pl.range(TP_SIZE):
+                pl.write(hidden_done, [src_tp, 0], zero)
+                pl.write(logits_done, [src_tp, 0], zero)
     return logits
 
 
@@ -340,7 +339,30 @@ def lm_head_test(
     lm_head(
         hidden_states, lm_head_weight, logit_row_indices, logits,
         hidden_window, hidden_done, logits_window, logits_done,
-        group_base, tp_rank, done_epoch,
+        group_base, tp_rank, done_epoch, pl.const(1, pl.INT32),
+    )
+    return logits
+
+
+@pl.jit
+def lm_head_batched_test(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+    clear_after_call: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+    lm_head(
+        hidden_states, lm_head_weight, logit_row_indices, logits,
+        hidden_window, hidden_done, logits_window, logits_done,
+        group_base, tp_rank, done_epoch, clear_after_call,
     )
     return logits
 
@@ -434,6 +456,7 @@ def lm_head_with_sampling(
         group_base,
         tp_rank,
         done_epoch,
+        pl.const(1, pl.INT32),
     )
     greedy_sample(logits, sampled_ids)
     return logits, sampled_ids

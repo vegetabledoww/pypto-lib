@@ -245,7 +245,12 @@ DECODE_BATCH = 4                  # B: requests per decode step
 DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
-PREFILL_BATCH = DEEPSEEK_V4_FLASH_SERVING_CONTRACT.max_prefill_requests_per_partition
+# One submitted rank-local prefill program owns this many independent requests.
+PREFILL_LOCAL_BATCH = DEEPSEEK_V4_FLASH_SERVING_CONTRACT.max_prefill_requests_per_partition
+# Leaf attention/compressor kernels still operate on one request's 128-token
+# tile.  The full prefill program loops over PREFILL_LOCAL_BATCH and gives every
+# request its own block tables, slot mappings and token extent.
+PREFILL_BATCH = 1
 PREFILL_SEQ = DEEPSEEK_V4_FLASH_SERVING_CONTRACT.prefill_tile_tokens
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 MOE_TOKENS = DECODE_TOKENS

@@ -54,7 +54,7 @@ INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
 IDX_CACHE_MAX_BLOCKS = PREFILL_IDX_MAX_BLOCKS
 
 # tiling
-K_TILE = 512                 # projection D (K) reduction tile
+K_TILE = 256                 # projection D (K) reduction tile
 OUT_TILE = 64                # projection OUT_DIM (N) tile
 HEAD_D_TILE = 128            # head-dim tile for the softmax pool
 HEAD_TILE = 64

@@ -50,7 +50,7 @@ CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLO
 CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
 
 # tiling
-K_TILE = 512                  # projection D (K) reduction tile
+K_TILE = 256                  # projection D (K) reduction tile
 OUT_TILE = 64                 # projection OUT_DIM (N) tile
 HEAD_D_TILE = 512             # head-dim tile for the softmax pool
 HEAD_TILE = 64

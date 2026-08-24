@@ -47,7 +47,7 @@ def test_deepseek_v4_flash_serving_capabilities(serving_contract_module) -> None
     assert contract.schema_version == "1"
     assert contract.prefill_tile_tokens == 128
     assert contract.max_prefill_tokens_per_request == 8192
-    assert contract.max_prefill_requests_per_partition == 1
+    assert contract.max_prefill_requests_per_partition == 4
     assert contract.requires_homogeneous_prefill_decode is True
 
 
@@ -92,5 +92,6 @@ def test_deepseek_v4_flash_config_uses_serving_contract(
             sys.modules["serving_contract"] = previous
 
     contract = serving_contract_module.DEEPSEEK_V4_FLASH_SERVING_CONTRACT
-    assert config.PREFILL_BATCH == contract.max_prefill_requests_per_partition
+    assert config.PREFILL_LOCAL_BATCH == contract.max_prefill_requests_per_partition
+    assert config.PREFILL_BATCH == 1
     assert config.PREFILL_SEQ == contract.prefill_tile_tokens

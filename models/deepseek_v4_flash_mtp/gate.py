@@ -102,8 +102,9 @@ def gate(
         sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
         sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
         sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
-        sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-        inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+        sq_mean = pl.mul(pl.reshape(sq_sum, [1, ROW_PAD]), 1.0 / D)
+        sq_mean = pl.set_validshape(sq_mean, 1, 1)
+        inv_rms = pl.recip(pl.sqrt(pl.add(sq_mean, NORM_EPS)))
         pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
 
         xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
@@ -114,10 +115,11 @@ def gate(
         amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
         amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
         xg_amax = pl.row_max(amax_reduce, amax_tmp)
-        xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
-        amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        amax_eps = pl.set_validshape(amax_eps, 1, 1)
-        xg_amax = pl.maximum(xg_amax, amax_eps)
+        xg_amax = pl.maximum(
+            pl.reshape(xg_amax, [1, ROW_PAD]),
+            pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS),
+        )
+        xg_amax = pl.set_validshape(xg_amax, 1, 1)
         # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
         scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
         scale_max = pl.set_validshape(scale_max, 1, 1)

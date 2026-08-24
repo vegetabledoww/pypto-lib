@@ -314,8 +314,18 @@ def prefill_indexer(
                             valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
                         else:
                             valid_len_t = 0
-                        weighted_valid_t = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len_t), pad_value=pl.PadValue.min)
-                        weighted_valid_t = pl.maximum(weighted_valid_t, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+                        weighted_score_s = pl.maximum(
+                            weighted_score_s,
+                            pl.full(
+                                [1, CACHE_TILE],
+                                dtype=pl.FP32,
+                                value=FP32_NEG_INF,
+                            ),
+                        )
+                        weighted_valid_t = pl.fillpad(
+                            pl.set_validshape(weighted_score_s, 1, valid_len_t),
+                            pad_value=pl.PadValue.min,
+                        )
                         score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
@@ -552,10 +562,18 @@ def _prefill_indexer_cp_score_topk(
                                 valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
                             else:
                                 valid_len_t = 0
-                            weighted_visible = pl.set_validshape(weighted_score_s, 1, valid_len_t)
+                            weighted_score_s = pl.maximum(
+                                weighted_score_s,
+                                pl.full(
+                                    [1, CACHE_TILE],
+                                    dtype=pl.FP32,
+                                    value=FP32_NEG_INF,
+                                ),
+                            )
+                            weighted_visible = pl.set_validshape(
+                                weighted_score_s, 1, valid_len_t
+                            )
                             weighted_valid_t = pl.fillpad(weighted_visible, pad_value=pl.PadValue.min)
-                            neg_inf_tile = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-                            weighted_valid_t = pl.maximum(weighted_valid_t, neg_inf_tile)
                             score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Write 1024 scores and 256 top-k indices.

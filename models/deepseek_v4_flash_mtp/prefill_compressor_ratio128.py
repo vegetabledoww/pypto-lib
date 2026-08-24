@@ -53,7 +53,7 @@ HCA_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 # tiling
-K_TILE = 512                 # projection D (K) reduction tile
+K_TILE = 256                 # projection D (K) reduction tile
 OUT_TILE = 32                # projection OUT_DIM (N) tile
 HEAD_TILE = 64               # head-dim tile for the pool and rmsnorm
 HCA_KV_STORE_TILE = 16
