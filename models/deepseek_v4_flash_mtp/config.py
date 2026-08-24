@@ -11,6 +11,8 @@
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
+from serving_contract import DEEPSEEK_V4_FLASH_SERVING_CONTRACT
+
 
 @dataclass(frozen=True)
 class DeepSeekV4Config:
@@ -243,8 +245,8 @@ DECODE_BATCH = 4                  # B: requests per decode step
 DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
-PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
-PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
+PREFILL_BATCH = DEEPSEEK_V4_FLASH_SERVING_CONTRACT.max_prefill_requests_per_partition
+PREFILL_SEQ = DEEPSEEK_V4_FLASH_SERVING_CONTRACT.prefill_tile_tokens
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 MOE_TOKENS = DECODE_TOKENS
 
