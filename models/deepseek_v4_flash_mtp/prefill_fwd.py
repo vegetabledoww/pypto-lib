@@ -436,6 +436,8 @@ def prefill_request_fwd(
             epoch_base: pl.Scalar[pl.INT32] = moe_epoch_offset + pl.cast(
                 tile_base // T * LAST_MOE_EPOCH, pl.INT32
             )
+            l0_moe_epoch: pl.Scalar[pl.INT32] = epoch_base + pl.cast(1, pl.INT32)
+            l1_moe_epoch: pl.Scalar[pl.INT32] = epoch_base + pl.cast(2, pl.INT32)
             nt = total_nt - tile_base
             nt = pl.max(pl.cast(1, pl.INT32), nt)
             nt = pl.min(nt, pl.cast(T, pl.INT32))
@@ -511,7 +513,7 @@ def prefill_request_fwd(
                     hidden,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    pl.cast(0, pl.INT32), nt, my_rank, epoch_base + pl.cast(1, pl.INT32),
+                    pl.cast(0, pl.INT32), nt, my_rank, l0_moe_epoch,
                 )
 
             # ===================== layer 1 : swa =================================
@@ -573,7 +575,7 @@ def prefill_request_fwd(
                     hidden,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    pl.cast(1, pl.INT32), nt, my_rank, epoch_base + pl.cast(2, pl.INT32),
+                    pl.cast(1, pl.INT32), nt, my_rank, l1_moe_epoch,
                 )
 
             # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
