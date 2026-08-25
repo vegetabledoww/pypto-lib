@@ -482,9 +482,9 @@ def _fwd_moe_tail(
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hidden_out: pl.Out[
         pl.Tensor[
@@ -555,7 +555,9 @@ def _fwd_moe_tail(
             wave_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            layer_id, effective_tokens, my_rank, moe_epoch,
+            layer_id, effective_tokens,
+            pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+            my_rank, moe_epoch,
         )
         x_next_work = pl.assemble(x_next_work, wave_out, [row0, 0, 0])
         expected_stage = stage_base + pl.cast(_WAVE0_STAGE_OFFSET + wave, pl.INT32)
@@ -858,9 +860,9 @@ def prefill_cp_fwd(
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Phase 3 final-tail weights (HC head + final RMSNorm). The HC head
@@ -1608,7 +1610,9 @@ def prefill_cp_fwd(
     # and the final rms_norm normalizes it into the BF16 hidden_out that the
     # host's lm_head_test consumes. Both pl.Out tensors are written in place.
     with pl.scope():
-        clear_moe_signals(publish_anchor, arrived, data_arrived, combine_arrived)
+        clear_moe_signals(
+            publish_anchor, recv_meta, arrived, data_arrived, combine_arrived
+        )
 
         wave_blocks = (T // COPY_TOKEN_TILE) * HC_MULT
         with pl.spmd(
@@ -1938,9 +1942,9 @@ def l3_prefill_cp_fwd(
         [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
     )
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 2], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 2], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..20).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -2047,11 +2051,11 @@ def l3_prefill_cp_fwd(
         )
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            data_arrived_buf, [N_RANKS, 2], dtype=pl.INT32
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            combine_arrived_buf, [N_RANKS, 2], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # Domain 4: HCA compact windows.

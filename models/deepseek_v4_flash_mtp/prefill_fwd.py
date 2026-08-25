@@ -45,6 +45,7 @@ from moe import (
     HC_MULT,
     IDX_PAD,
     MIX_HC,
+    META_EPOCH_STRIDE,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
@@ -142,6 +143,22 @@ FWD_TOKENS_DYN = pl.dynamic("PREFILL_FWD_TOKENS_DYN")
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 PRE_HC_COPY_TOKEN_TILE = 4
 assert T % PRE_HC_COPY_TOKEN_TILE == 0
+MAX_PREFILL_MOE_EPOCH = (
+    LOCAL_PREFILL_BATCH
+    * (
+        (
+            config.DEEPSEEK_V4_FLASH_SERVING_CONTRACT.max_prefill_tokens_per_request
+            + T
+            - 1
+        )
+        // T
+    )
+    * LAST_MOE_EPOCH
+)
+MAX_PACKED_META = (
+    MAX_PREFILL_MOE_EPOCH * META_EPOCH_STRIDE + META_EPOCH_STRIDE - 1
+)
+assert MAX_PACKED_META <= 2**31 - 1, "packed MoE metadata exceeds INT32"
 
 # The LM head owns its barrier counters, so its epoch restarts at 1 rather
 # than continuing the MoE numbering.
@@ -354,9 +371,9 @@ def prefill_request_fwd(
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -513,7 +530,9 @@ def prefill_request_fwd(
                     hidden,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    pl.cast(0, pl.INT32), nt, my_rank, l0_moe_epoch,
+                    pl.cast(0, pl.INT32), nt,
+                    pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+                    my_rank, l0_moe_epoch,
                 )
 
             # ===================== layer 1 : swa =================================
@@ -575,7 +594,9 @@ def prefill_request_fwd(
                     hidden,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    pl.cast(1, pl.INT32), nt, my_rank, l1_moe_epoch,
+                    pl.cast(1, pl.INT32), nt,
+                    pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+                    my_rank, l1_moe_epoch,
                 )
 
             # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
@@ -671,7 +692,9 @@ def prefill_request_fwd(
                         hidden_mid,
                         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                         routed_y_buf, combine_arrived,
-                        csa_layer, nt, my_rank, csa_moe_epoch,
+                        csa_layer, nt,
+                        pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+                        my_rank, csa_moe_epoch,
                     )
 
                 # ---- hca attention weights (per-FWD by hca_layer, compact by loop_i) ----
@@ -742,7 +765,9 @@ def prefill_request_fwd(
                         hidden,
                         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                         routed_y_buf, combine_arrived,
-                        hca_layer, nt, my_rank, hca_moe_epoch,
+                        hca_layer, nt,
+                        pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+                        my_rank, hca_moe_epoch,
                     )
 
             # ================ layer 42 (FWD_LAST_LAYER) : csa -> x_out ===========
@@ -833,7 +858,9 @@ def prefill_request_fwd(
                     pre_hc_hidden_tile,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    csa_layer_last, nt, my_rank, last_moe_epoch,
+                    csa_layer_last, nt,
+                    pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+                    my_rank, last_moe_epoch,
                 )
             x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
             with pl.scope():
@@ -874,6 +901,7 @@ def prefill_request_fwd(
     if clear_after_request != 0:
         clear_moe_signals(
             pre_hc_hidden_tile,
+            recv_meta,
             arrived,
             data_arrived,
             combine_arrived,
@@ -1038,9 +1066,9 @@ def prefill_fwd(
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32],
     hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1318,9 +1346,9 @@ def l3_prefill_fwd(
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 2], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 2], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1328,9 +1356,9 @@ def l3_prefill_fwd(
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 2], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived: pld.DistributedTensor[[N_RANKS, 2], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 2], dtype=pl.INT32)
         x_hc_rank = x_hc[r]
         hidden_rank = hidden_out[r]
         ori_slot_rank = ori_slot_mapping[r]

@@ -304,9 +304,9 @@ def _prefill_layer_cp_moe_tail(
     recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     stage_tokens: pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32],
@@ -371,7 +371,9 @@ def _prefill_layer_cp_moe_tail(
             shared_w2, shared_w2_scale, wave_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            layer_id, effective_tokens, my_rank, pl.cast(wave + 1, pl.INT32),
+            layer_id, effective_tokens,
+            pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+            my_rank, pl.cast(wave + 1, pl.INT32),
         )
         x_next_work = pl.assemble(x_next_work, wave_out, [row0, 0, 0])
         stage_tokens = _record_wave_completion(
@@ -398,7 +400,7 @@ def _prefill_layer_cp_moe_tail(
         anchor_tile[0:1, 0:1, 0:8] = completion
     # Publication naturally depends on all rank-local wave outputs.
     x_next = _publish_x_next_after_stage(x_next_work, active_flat, x_next)
-    clear_moe_signals(anchor_tile, arrived, data_arrived, combine_arrived)
+    clear_moe_signals(anchor_tile, recv_meta, arrived, data_arrived, combine_arrived)
     return x_next
 
 
@@ -489,9 +491,9 @@ def prefill_layer_cp_swa(
     recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -691,9 +693,9 @@ def prefill_layer_cp_hca(
     recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -955,9 +957,9 @@ def prefill_layer_cp_csa(
     recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 2], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -1128,9 +1130,9 @@ def l3_prefill_layer_cp_swa(
         [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1151,11 +1153,11 @@ def l3_prefill_layer_cp_swa(
         )
         arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # SWA attention weights are shared across ranks (passed directly, not
@@ -1368,9 +1370,9 @@ def l3_prefill_layer_cp_hca(
         [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
 
     # Domain 4: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1417,11 +1419,11 @@ def l3_prefill_layer_cp_hca(
         )
         arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # HCA attention weights are shared across ranks (passed directly, not
@@ -1688,9 +1690,9 @@ def l3_prefill_layer_cp_csa(
         [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 2], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1755,11 +1757,11 @@ def l3_prefill_layer_cp_csa(
         )
         arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 2], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
 
